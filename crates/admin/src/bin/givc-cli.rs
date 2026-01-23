@@ -11,7 +11,7 @@ use serde::ser::Serialize;
 use std::path::PathBuf;
 use std::time;
 use tokio::time::interval;
-use tracing::info;
+use tracing::debug;
 
 #[derive(Debug, Parser)] // requires `derive` feature
 #[command(name = "givc-cli")]
@@ -277,7 +277,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     givc::trace_init()?;
 
     let cli = Cli::parse();
-    info!("CLI is {:#?}", cli);
+    debug!("CLI is {:#?}", cli);
 
     let tls = if cli.notls {
         None
@@ -295,7 +295,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     // FIXME; big kludge, but allow to test vsock connection
     let admin = if let Some(vsock) = cli.vsock {
-        info!("Connection diverted to VSock");
+        debug!("Connection diverted to VSock");
         AdminClient::from_endpoint_address(EndpointAddress::Vsock(parse_vsock_addr(&vsock)?), tls)
     } else {
         AdminClient::new(cli.addr, cli.port, tls)

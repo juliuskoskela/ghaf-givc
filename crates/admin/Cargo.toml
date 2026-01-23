@@ -31,7 +31,7 @@ tokio-vsock = "0.7"
 tonic-reflection = "0.14"
 tonic-types = "0.14"
 tonic = { version = "0.14", features = ["tls-ring"] }
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-journald = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 x509-parser = "0.18"

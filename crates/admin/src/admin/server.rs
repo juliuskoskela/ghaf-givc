@@ -265,7 +265,7 @@ impl AdminServiceImpl {
     }
 
     pub(crate) async fn handle_error(&self, entry: RegistryEntry) -> anyhow::Result<()> {
-        info!(
+        debug!(
             "Handling error for {} vm type {} service type {}",
             entry.name, entry.r#type.vm, entry.r#type.service
         );
@@ -435,7 +435,7 @@ impl pb::admin_service_server::AdminService for AdminService {
     ) -> std::result::Result<tonic::Response<pb::RegistryResponse>, tonic::Status> {
         let req = request.into_inner();
 
-        info!("Registering service {:?}", req);
+        debug!("Registering service {:?}", req);
         let entry = RegistryEntry::try_from(req)
             .map_err(|e| Status::new(Code::InvalidArgument, format!("{e}")))?;
         let notify = matches!(
@@ -480,7 +480,7 @@ impl pb::admin_service_server::AdminService for AdminService {
                 }
             });
         }
-        info!("Responding with {res:?}");
+        trace!("Responding with {res:?}");
         Ok(Response::new(res))
     }
 

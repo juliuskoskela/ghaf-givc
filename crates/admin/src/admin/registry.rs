@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, anyhow, bail};
 use givc_common::query::{Event, QueryResult};
 use tokio::sync::broadcast;
-use tracing::{debug, info};
+use tracing::{debug, trace};
 
 use super::entry::RegistryEntry;
 use crate::types::{UnitStatus, UnitType};
@@ -37,13 +37,13 @@ impl Registry {
 
     pub(crate) fn register(&self, entry: RegistryEntry) {
         let mut state = self.map.lock().unwrap();
-        info!("Registering {:?}", entry);
+        debug!("Registering {:?}", entry);
         let event = Event::UnitRegistered(entry.clone().into());
         if let Some(old) = state.insert(entry.name.clone(), entry) {
             debug!("Replaced old entry {:?}", old);
             self.send_event(Event::UnitShutdown(old.into()));
         }
-        info!("Sending event {event:?}");
+        trace!("Sending event {event:?}");
         self.send_event(event);
     }
 
@@ -58,7 +58,7 @@ impl Registry {
                 }) {
                     self.send_event(Event::UnitShutdown(entry.into()));
                 }
-                info!("Deregistering {:?}", entry);
+                debug!("Deregistering {:?}", entry);
                 self.send_event(Event::UnitShutdown(entry.into()));
                 Ok(())
             }
