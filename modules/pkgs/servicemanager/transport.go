@@ -105,6 +105,25 @@ func (s *SystemdControlServer) GetUnitStatus(ctx context.Context, req *givc_syst
 func (s *SystemdControlServer) StartUnit(ctx context.Context, req *givc_systemd.UnitRequest) (*givc_systemd.UnitResponse, error) {
 	log.Infof("Incoming request to (re)start %v\n", req)
 
+	// Shutdown-class targets (poweroff/reboot/suspend/...) tear this agent down, so the systemd
+	// job never reports completion before we are killed, and re-querying status afterwards races
+	// the teardown. For these, dispatch the job and acknowledge as soon as systemd accepts it,
+	// so the caller gets a truthful "accepted" reply before the VM goes down.
+	if IsShutdownTarget(req.UnitName) {
+		if err := s.Controller.StartUnitNoWait(ctx, req.UnitName); err != nil {
+			log.Infof("[StartUnit] Error dispatching shutdown target %s: %v", req.UnitName, err)
+			return nil, grpc_status.Error(grpc_codes.Unknown, fmt.Sprintf("cannot start unit: %s", err))
+		}
+		log.Infof("[StartUnit] Accepted shutdown target %s, acknowledging before teardown", req.UnitName)
+		return &givc_systemd.UnitResponse{
+			UnitStatus: &givc_systemd.UnitStatus{
+				Name:        req.UnitName,
+				ActiveState: "activating",
+				SubState:    "start",
+			},
+		}, nil
+	}
+
 	err := s.Controller.StartUnit(ctx, req.UnitName)
 	if err != nil {
 		log.Infof("[StartUnit] Error starting unit: %v", err)

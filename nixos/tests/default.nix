@@ -4,6 +4,7 @@
   imports = [
     ./shared-configs.nix
     ./admin.nix
+    ./direct-poweroff.nix
     ./dbus.nix
     ./app.nix
     ./ota-update.nix

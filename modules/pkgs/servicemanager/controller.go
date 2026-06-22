@@ -159,6 +159,61 @@ func (c *SystemdController) StartUnit(ctx context.Context, name string) error {
 	return nil
 }
 
+// shutdownTargets are systemd targets whose activation tears the system (and therefore this
+// agent) down. For these, the dbus job-completion signal cannot be relied upon to arrive before
+// the agent process is killed, so a caller must not block waiting for it.
+var shutdownTargets = map[string]bool{
+	"poweroff.target":               true,
+	"reboot.target":                 true,
+	"halt.target":                   true,
+	"kexec.target":                  true,
+	"suspend.target":                true,
+	"hibernate.target":              true,
+	"hybrid-sleep.target":           true,
+	"suspend-then-hibernate.target": true,
+	"sleep.target":                  true,
+}
+
+// IsShutdownTarget reports whether activating name will tear down (or suspend) the system,
+// meaning the systemd job-completion signal cannot be relied upon to arrive before the agent
+// is killed or frozen.
+func IsShutdownTarget(name string) bool {
+	return shutdownTargets[name]
+}
+
+// StartUnitNoWait starts a unit without blocking on systemd job completion. It performs the same
+// whitelist authorization check as StartUnit, then dispatches the start job and returns as soon
+// as systemd has accepted it. This is used for shutdown-class targets (poweroff/reboot/suspend/
+// ...), where blocking on completion would hang because the agent is killed mid-shutdown — and
+// where re-querying status afterwards races the teardown.
+func (c *SystemdController) StartUnitNoWait(ctx context.Context, name string) error {
+
+	// Input validation
+	if ctx == nil {
+		return fmt.Errorf("context cannot be nil")
+	}
+	if name == "" {
+		return fmt.Errorf("incorrect input, must be unit name")
+	}
+
+	// Find unit(s); enforces the whitelist (authorization gate, same as StartUnit).
+	units, err := c.FindUnit(name)
+	if err != nil {
+		return err
+	}
+
+	// Dispatch the start job for each matching unit without waiting for completion. A nil result
+	// channel makes go-systemd fire-and-forget; the call still returns synchronously if systemd
+	// refuses to enqueue the job, so an authorization/dispatch failure is reported to the caller.
+	for _, targetUnit := range units {
+		if _, err := c.conn.StartUnitContext(ctx, targetUnit.Name, "replace", nil); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // StopUnit stops a unit by name.
 func (c *SystemdController) StopUnit(ctx context.Context, name string) error {
 

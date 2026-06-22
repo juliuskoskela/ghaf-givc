@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use clap::{Parser, Subcommand};
-use givc::endpoint::TlsConfig;
-use givc::types::UnitType;
+use givc::endpoint::{EndpointConfig, TlsConfig};
+use givc::types::{TransportConfig, UnitType};
 use givc::utils::vsock::parse_vsock_addr;
 use givc_client::client::AdminClient;
 use givc_common::address::EndpointAddress;
@@ -13,8 +13,10 @@ use ota_update::cli::{CachixOptions, QueryUpdates, query_updates};
 use serde::ser::Serialize;
 use std::path::PathBuf;
 use std::time;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::interval;
+use tokio::time::{Instant, interval, sleep, timeout};
+use tonic::Code;
 use tracing::info;
 
 #[derive(Debug, Parser)] // requires `derive` feature
@@ -44,6 +46,13 @@ struct Cli {
     #[arg(long, env = "GIVC_NO_TLS", default_value_t = false)]
     notls: bool,
 
+    /// Delivery timeout in seconds for `--direct` lifecycle calls. Bounds *delivery* to the
+    /// agent, not the guest poweroff itself; keep it well below the host's microvm
+    /// `TimeoutStopSec` so a fallback still has budget. Defaults to 3s. Marked `global` so it
+    /// may be given after the subcommand (e.g. `start service ... poweroff.target --timeout 8`).
+    #[arg(long, env = "GIVC_TIMEOUT", global = true)]
+    timeout: Option<u64>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -64,6 +73,12 @@ enum StartSub {
         servicename: String,
         #[arg(long)]
         vm: String,
+        /// Deliver the unit start directly to the target VM's agent, bypassing the admin
+        /// coordinator. `--addr`/`--port`/`--vsock` and `--name` are then interpreted as the
+        /// *guest agent* endpoint (not the admin), and `--vm` becomes a cosmetic label.
+        /// Returns the documented lifecycle exit codes (see `direct_lifecycle`).
+        #[arg(long, default_value_t = false)]
+        direct: bool,
     },
 }
 
@@ -72,7 +87,13 @@ impl StartSub {
         let response = match self {
             StartSub::App { app, vm, args } => admin.start_app(app, vm, args).await?,
             StartSub::Vm { vm } => admin.start_vm(vm).await?,
-            StartSub::Service { servicename, vm } => admin.start_service(servicename, vm).await?,
+            // `--direct` is intercepted in `main` before the admin client is built; reaching
+            // here means a normal admin-routed service start.
+            StartSub::Service {
+                servicename,
+                vm,
+                direct: _,
+            } => admin.start_service(servicename, vm).await?,
         };
         println!("{response:?}");
         Ok(())
@@ -349,6 +370,125 @@ async fn sysinfo(admin: AdminClient) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Process exit codes for the coordinator-independent lifecycle path
+// (`start service --vm <vm> <unit> --direct`). This is a stable contract consumed by the
+// host's microvm `ExecStop`:
+//   0  ACCEPTED            delivered: a clean reply, OR the connection dropped / the deadline
+//                          fired AFTER the request was sent (the normal poweroff case, where
+//                          the agent is killed mid-shutdown before it can reply).
+//   10 UNREACHABLE         connect() failed (refused / no route / TLS handshake) — nothing was
+//                          delivered, so the host can fall back immediately.
+//   11 TIMEOUT_PRE_ACCEPT  `--timeout` fired during connect, before the request was sent.
+//   12 DENIED              PermissionDenied / Unauthenticated (e.g. caller IP not in cert SAN).
+//   14 AGENT_ERROR         the agent returned an error Status (e.g. unit not whitelisted).
+//   2  USAGE               argument parse error (emitted by clap directly).
+const EXIT_ACCEPTED: i32 = 0;
+const EXIT_UNREACHABLE: i32 = 10;
+const EXIT_TIMEOUT_PRE_ACCEPT: i32 = 11;
+const EXIT_DENIED: i32 = 12;
+const EXIT_AGENT_ERROR: i32 = 14;
+
+const DEFAULT_DIRECT_TIMEOUT_SECS: u64 = 3;
+
+/// If `cmd` is a `--direct` `start service` invocation, return the target unit name.
+fn direct_service_target(cmd: &Commands) -> Option<&str> {
+    match cmd {
+        Commands::Start {
+            start:
+                StartSub::Service {
+                    servicename,
+                    direct: true,
+                    ..
+                },
+        } => Some(servicename),
+        _ => None,
+    }
+}
+
+/// Deliver a lifecycle unit start directly to a VM's agent `UnitControlService`, bypassing the
+/// admin coordinator. Returns the process exit code (see the `EXIT_*` contract above).
+///
+/// The connection reuses the CLI's existing mTLS identity, and the guest agent's existing unit
+/// whitelist authorizes the unit — so this preserves the same security guarantees as the
+/// admin-mediated path while removing the dependency on the coordinator being alive.
+async fn direct_lifecycle(
+    address: EndpointAddress,
+    tls: Option<(String, TlsConfig)>,
+    unit: String,
+    timeout_secs: u64,
+) -> i32 {
+    use givc_common::pb::systemd::UnitRequest;
+    use givc_common::pb::systemd::unit_control_service_client::UnitControlServiceClient;
+
+    let (tls_name, tls) = match tls {
+        Some((name, tls)) => (name, Some(tls)),
+        None => (String::from("bogus(no tls)"), None),
+    };
+    let endpoint = EndpointConfig {
+        transport: TransportConfig { address, tls_name },
+        tls,
+    };
+
+    let budget = Duration::from_secs(timeout_secs);
+    let deadline = Instant::now() + budget;
+
+    // Phase 1 — connect to the agent. A connect failure means nothing was delivered, so the
+    // host can fall back immediately. One in-budget retry absorbs a transient blip during a
+    // busy host shutdown (EndpointConfig's own connect timeout is a tight 300ms).
+    let mut channel = None;
+    for attempt in 0..2u32 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            info!("direct: connect budget exhausted before delivery");
+            return EXIT_TIMEOUT_PRE_ACCEPT;
+        }
+        match timeout(remaining, endpoint.connect()).await {
+            Ok(Ok(ch)) => {
+                channel = Some(ch);
+                break;
+            }
+            Ok(Err(e)) => {
+                info!("direct: connect attempt {attempt} failed: {e:#}");
+                // Brief backoff before the single retry, only if budget remains.
+                let nap = Duration::from_millis(100);
+                if attempt == 0 && deadline.saturating_duration_since(Instant::now()) > nap {
+                    sleep(nap).await;
+                }
+            }
+            Err(_elapsed) => {
+                info!("direct: connect timed out before delivery");
+                return EXIT_TIMEOUT_PRE_ACCEPT;
+            }
+        }
+    }
+    let Some(channel) = channel else {
+        return EXIT_UNREACHABLE;
+    };
+
+    // Phase 2 — issue StartUnit. Once the request is on the wire, a dropped connection or an
+    // elapsed deadline means the agent accepted it and is tearing the VM down: that is SUCCESS,
+    // not a transport error. We inspect the raw `tonic::Status` here (deliberately NOT
+    // `rewrap_err`, which discards the gRPC `Code`) and translate to the documented exit codes.
+    let mut client = UnitControlServiceClient::new(channel);
+    let request = UnitRequest { unit_name: unit };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match timeout(remaining, client.start_unit(request)).await {
+        // Deadline after the request was sent: assume accepted (agent is shutting down).
+        Err(_elapsed) => EXIT_ACCEPTED,
+        // Clean reply (e.g. the agent acked the lifecycle target).
+        Ok(Ok(_response)) => EXIT_ACCEPTED,
+        Ok(Err(status)) => match status.code() {
+            // Connection reset / cancelled / deadline once the request was already sent.
+            Code::Unavailable | Code::Cancelled | Code::Aborted | Code::DeadlineExceeded => {
+                EXIT_ACCEPTED
+            }
+            Code::PermissionDenied | Code::Unauthenticated => EXIT_DENIED,
+            // Unknown (server-side failure, e.g. unit not whitelisted) and anything else.
+            _ => EXIT_AGENT_ERROR,
+        },
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     givc::trace_init()?;
@@ -369,6 +509,29 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             },
         ))
     };
+
+    // R1: coordinator-independent lifecycle delivery. When `--direct` is set on
+    // `start service`, dial the guest agent's UnitControlService directly — bypassing the admin
+    // coordinator, which during a full-system shutdown may itself be tearing down — and exit
+    // with the documented lifecycle status code. This is intercepted before the AdminClient is
+    // built so no connection to the admin is attempted.
+    if let Some(unit) = direct_service_target(&cli.command) {
+        let address = match &cli.vsock {
+            Some(vsock) => EndpointAddress::Vsock(parse_vsock_addr(vsock)?),
+            None => EndpointAddress::Tcp {
+                addr: cli.addr.clone(),
+                port: cli.port,
+            },
+        };
+        let code = direct_lifecycle(
+            address,
+            tls,
+            unit.to_string(),
+            cli.timeout.unwrap_or(DEFAULT_DIRECT_TIMEOUT_SECS),
+        )
+        .await;
+        std::process::exit(code);
+    }
 
     // FIXME; big kludge, but allow to test vsock connection
     let admin = if let Some(vsock) = cli.vsock {
